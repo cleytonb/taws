@@ -7,9 +7,6 @@ use std::path::PathBuf;
 pub fn list_profiles() -> Result<Vec<String>> {
     let mut profiles = HashSet::new();
 
-    // Always include default
-    profiles.insert("default".to_string());
-
     // Read from ~/.aws/credentials
     if let Some(creds_path) = get_aws_credentials_path() {
         if let Ok(content) = fs::read_to_string(&creds_path) {

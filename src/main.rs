@@ -260,9 +260,18 @@ enum InitResult {
         available_regions: Vec<String>,
         readonly: bool,
     },
+    /// No default profile — user must pick one
+    ProfilePickerRequired {
+        available_profiles: Vec<String>,
+        available_regions: Vec<String>,
+        config: Config,
+        region: String,
+        endpoint_url: Option<String>,
+        readonly: bool,
+    },
 }
 
-async fn initialize_with_splash<B: Backend>(
+async fn initialize_with_splash<B: Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     args: &Args,
 ) -> Result<Option<App>>
@@ -316,6 +325,25 @@ where
                 config,
                 available_profiles,
                 available_regions,
+                readonly,
+            )
+            .await
+        }
+        Some(InitResult::ProfilePickerRequired {
+            available_profiles,
+            available_regions,
+            config,
+            region,
+            endpoint_url,
+            readonly,
+        }) => {
+            handle_profile_picker_flow(
+                terminal,
+                available_profiles,
+                available_regions,
+                config,
+                region,
+                endpoint_url,
                 readonly,
             )
             .await
@@ -377,12 +405,25 @@ where
     terminal.draw(|f| render_splash(f, &splash))?;
 
     let available_profiles =
-        aws::profiles::list_profiles().unwrap_or_else(|_| vec!["default".to_string()]);
+        aws::profiles::list_profiles().unwrap_or_default();
     let available_regions = aws::profiles::list_regions();
     splash.complete_step();
 
     if check_abort()? {
         return Ok(None);
+    }
+
+    // If profile wasn't explicitly specified and doesn't exist in config, show picker
+    let has_explicit_profile = args.profile.is_some() || std::env::var("AWS_PROFILE").is_ok();
+    if !has_explicit_profile && !available_profiles.contains(&profile) {
+        return Ok(Some(InitResult::ProfilePickerRequired {
+            available_profiles,
+            available_regions,
+            config,
+            region,
+            endpoint_url,
+            readonly: args.readonly,
+        }));
     }
 
     // Step 3: Initialize all AWS clients (check for SSO requirement)
@@ -391,7 +432,27 @@ where
 
     let client_result =
         aws::client::AwsClients::new_with_sso_check(&profile, &region, endpoint_url.clone())
-            .await?;
+            .await;
+
+    // If credentials failed and no profile was explicitly specified, show picker
+    let client_result = match client_result {
+        Err(e) if !has_explicit_profile && !available_profiles.is_empty() => {
+            tracing::debug!(
+                "Credential error for implicit profile '{}': {} — showing profile picker",
+                profile,
+                e
+            );
+            return Ok(Some(InitResult::ProfilePickerRequired {
+                available_profiles,
+                available_regions,
+                config,
+                region,
+                endpoint_url,
+                readonly: args.readonly,
+            }));
+        }
+        other => other?,
+    };
 
     let (clients, actual_region) = match client_result {
         ClientResult::Ok(clients, actual_region) => (clients, actual_region),
@@ -1392,6 +1453,263 @@ fn render_console_login_standalone(f: &mut ratatui::Frame, console_state: &app::
                 .block(block)
                 .alignment(Alignment::Center);
             f.render_widget(paragraph, dialog_area);
+        }
+    }
+}
+
+/// Render profile picker dialog
+fn render_profile_picker(f: &mut ratatui::Frame, profiles: &[String], selected: usize) {
+    use ratatui::{
+        layout::{Alignment, Constraint, Direction, Layout, Rect},
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    };
+
+    fn centered_rect(width_pct: u16, height: u16, r: Rect) -> Rect {
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Length(height),
+                Constraint::Percentage(70),
+            ])
+            .split(r);
+
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage((100 - width_pct) / 2),
+                Constraint::Percentage(width_pct),
+                Constraint::Percentage((100 - width_pct) / 2),
+            ])
+            .split(popup_layout[1])[1]
+    }
+
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let bg = Block::default().style(Style::default().bg(Color::Black));
+    f.render_widget(bg, area);
+
+    let visible = profiles.len().min(12) as u16;
+    let height = visible + 7;
+
+    let dialog_area = centered_rect(60, height, area);
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Select AWS Profile ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(Alignment::Center);
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let subtitle = Paragraph::new(Line::from(Span::styled(
+        "No default profile found. Select one to continue:",
+        Style::default().fg(Color::White),
+    )))
+    .alignment(Alignment::Center);
+    f.render_widget(subtitle, chunks[0]);
+
+    let items: Vec<ListItem> = profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if i == selected { "▸ " } else { "  " };
+            ListItem::new(format!("{}{}", prefix, p)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items);
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+        Span::styled(" Navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::styled(" Select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::styled(" Cancel", Style::default().fg(Color::DarkGray)),
+    ]))
+    .alignment(Alignment::Center);
+    f.render_widget(footer, chunks[2]);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_profile_picker_flow<B: Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
+    available_profiles: Vec<String>,
+    available_regions: Vec<String>,
+    config: Config,
+    region: String,
+    endpoint_url: Option<String>,
+    readonly: bool,
+) -> Result<Option<App>>
+where
+    B::Error: Send + Sync + 'static,
+{
+    if available_profiles.is_empty() {
+        cleanup_terminal(terminal)?;
+        eprintln!("No AWS profiles found. Please configure ~/.aws/config or ~/.aws/credentials");
+        return Ok(None);
+    }
+
+    let mut selected = 0usize;
+
+    loop {
+        terminal.draw(|f| render_profile_picker(f, &available_profiles, selected))?;
+
+        if poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = read()? {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if selected > 0 {
+                            selected -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if selected < available_profiles.len() - 1 {
+                            selected += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let chosen = available_profiles[selected].clone();
+                        let mut splash = SplashState::new();
+
+                        splash.set_message(&format!("Loading AWS config [profile: {}]", chosen));
+                        terminal.draw(|f| render_splash(f, &splash))?;
+                        splash.complete_step();
+
+                        splash.set_message(&format!("Connecting to AWS services [{}]", region));
+                        terminal.draw(|f| render_splash(f, &splash))?;
+
+                        let client_result = aws::client::AwsClients::new_with_sso_check(
+                            &chosen,
+                            &region,
+                            endpoint_url.clone(),
+                        )
+                        .await?;
+
+                        match client_result {
+                            ClientResult::Ok(clients, actual_region) => {
+                                splash.complete_step();
+                                splash.set_message(&format!(
+                                    "Fetching instances from {}",
+                                    actual_region
+                                ));
+                                terminal.draw(|f| render_splash(f, &splash))?;
+
+                                let (instances, initial_error) =
+                                    match resource::fetch_resources_paginated(
+                                        "ec2-instances",
+                                        &clients,
+                                        &[],
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => (result.items, None),
+                                        Err(e) => {
+                                            let error_msg = aws::client::format_aws_error(&e);
+                                            (Vec::new(), Some(error_msg))
+                                        }
+                                    };
+
+                                splash.complete_step();
+                                splash.set_message("Ready!");
+                                terminal.draw(|f| render_splash(f, &splash))?;
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                                let mut app = App::from_initialized(
+                                    clients,
+                                    chosen,
+                                    actual_region,
+                                    available_profiles,
+                                    available_regions,
+                                    instances,
+                                    config,
+                                    readonly,
+                                    endpoint_url,
+                                );
+
+                                if let Some(err) = initial_error {
+                                    app.error_message = Some(err);
+                                }
+
+                                return Ok(Some(app));
+                            }
+                            ClientResult::SsoLoginRequired {
+                                profile,
+                                sso_session,
+                                region: sso_region,
+                                endpoint_url: sso_eu,
+                            } => {
+                                return handle_sso_login_flow(
+                                    terminal,
+                                    profile,
+                                    sso_session,
+                                    sso_region,
+                                    sso_eu,
+                                    config,
+                                    available_profiles,
+                                    available_regions,
+                                    readonly,
+                                )
+                                .await;
+                            }
+                            ClientResult::ConsoleLoginRequired {
+                                profile,
+                                login_session,
+                                region: cl_region,
+                                endpoint_url: cl_eu,
+                            } => {
+                                return handle_console_login_flow(
+                                    terminal,
+                                    profile,
+                                    login_session,
+                                    cl_region,
+                                    cl_eu,
+                                    config,
+                                    available_profiles,
+                                    available_regions,
+                                    readonly,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
